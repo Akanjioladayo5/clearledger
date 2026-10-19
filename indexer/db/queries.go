@@ -438,18 +438,90 @@ func GetPoolSnapshotHistory(ctx context.Context, limit int) ([]*DbPoolSnapshotHi
 	return history, nil
 }
 
+// Decode state recorded on every events_log row. "decoded" means the event
+// was understood and applied; "unknown_version" and "malformed" rows are kept
+// verbatim so a future listener build can reprocess them.
+const (
+	DecodeStatusDecoded        = "decoded"
+	DecodeStatusUnknownVersion = "unknown_version"
+	DecodeStatusMalformed      = "malformed"
+)
+
+// EventLogRecord is the complete row the listener writes for an event. The
+// metadata fields are the audit trail required to reprocess a row without
+// asking the RPC again.
+type EventLogRecord struct {
+	EventID        string
+	ContractID     string
+	TxHash         string
+	Ledger         int32
+	LedgerClosedAt int64
+	EventType      string
+	SchemaVersion  int
+	DecodeStatus   string
+	DecodeError    string
+	Data           interface{}
+	RawEvent       interface{}
+}
+
+// LogEvent writes a decoded event using the historical signature. New callers
+// that need version/raw-event retention should use LogEventRecord.
 func LogEvent(ctx context.Context, q Querier, eventID, contractID string, ledger int32, ledgerClosedAt int64, eventType string, data interface{}) error {
-	dataBytes, err := json.Marshal(data)
+	return LogEventRecord(ctx, q, &EventLogRecord{
+		EventID:        eventID,
+		ContractID:     contractID,
+		Ledger:         ledger,
+		LedgerClosedAt: ledgerClosedAt,
+		EventType:      eventType,
+		SchemaVersion:  1,
+		DecodeStatus:   DecodeStatusDecoded,
+		Data:           data,
+	})
+}
+
+// LogEventRecord persists an event's decode metadata alongside its payload.
+// RawEvent is stored as JSONB for unknown-version and malformed rows so no
+// bytes of the original event are lost.
+func LogEventRecord(ctx context.Context, q Querier, record *EventLogRecord) error {
+	if record == nil {
+		return fmt.Errorf("queries: log event: nil record")
+	}
+	dataBytes, err := json.Marshal(record.Data)
 	if err != nil {
 		return fmt.Errorf("queries: log event: marshal data: %w", err)
 	}
+	if record.Data == nil {
+		dataBytes = []byte("{}")
+	}
+	var rawBytes []byte
+	if record.RawEvent != nil {
+		rawBytes, err = json.Marshal(record.RawEvent)
+		if err != nil {
+			return fmt.Errorf("queries: log event: marshal raw event: %w", err)
+		}
+	}
+	status := record.DecodeStatus
+	if status == "" {
+		status = DecodeStatusDecoded
+	}
+	schemaVersion := record.SchemaVersion
+	if schemaVersion <= 0 && status == DecodeStatusDecoded {
+		schemaVersion = 1
+	}
 
 	query := `
-		INSERT INTO events_log (event_id, contract_id, ledger, ledger_closed_at, event_type, data)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO events_log (
+			event_id, contract_id, ledger, ledger_closed_at, event_type, data,
+			schema_version, decode_status, decode_error, tx_hash, raw_event
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT (event_id) DO NOTHING
 	`
-	_, err = q.Exec(ctx, query, eventID, contractID, ledger, ledgerClosedAt, eventType, dataBytes)
+	_, err = q.Exec(ctx, query,
+		record.EventID, record.ContractID, record.Ledger, record.LedgerClosedAt,
+		record.EventType, dataBytes, schemaVersion, status, record.DecodeError,
+		record.TxHash, rawBytes,
+	)
 	if err != nil {
 		return fmt.Errorf("queries: log event: %w", err)
 	}
@@ -495,15 +567,35 @@ type EventLog struct {
 	ID             int             `json:"id"`
 	EventID        string          `json:"event_id"`
 	ContractID     string          `json:"contract_id"`
+	TxHash         *string         `json:"tx_hash,omitempty"`
 	Ledger         int32           `json:"ledger"`
 	LedgerClosedAt int64           `json:"ledger_closed_at"`
 	EventType      string          `json:"event_type"`
+	SchemaVersion  int             `json:"schema_version"`
+	DecodeStatus   string          `json:"decode_status"`
+	DecodeError    *string         `json:"decode_error,omitempty"`
 	Data           json.RawMessage `json:"data"`
+	RawEvent       json.RawMessage `json:"raw_event,omitempty"`
+}
+
+const eventLogColumns = `id, event_id, contract_id, tx_hash, ledger, ledger_closed_at,
+	event_type, schema_version, decode_status, decode_error, data, raw_event`
+
+func scanEventLog(row interface{ Scan(...any) error }) (*EventLog, error) {
+	var ev EventLog
+	if err := row.Scan(
+		&ev.ID, &ev.EventID, &ev.ContractID, &ev.TxHash, &ev.Ledger,
+		&ev.LedgerClosedAt, &ev.EventType, &ev.SchemaVersion,
+		&ev.DecodeStatus, &ev.DecodeError, &ev.Data, &ev.RawEvent,
+	); err != nil {
+		return nil, err
+	}
+	return &ev, nil
 }
 
 func GetRecentEvents(ctx context.Context, limit int) ([]*EventLog, error) {
 	query := `
-		SELECT id, event_id, contract_id, ledger, ledger_closed_at, event_type, data
+		SELECT ` + eventLogColumns + `
 		FROM events_log
 		ORDER BY ledger_closed_at DESC, id DESC
 		LIMIT $1
@@ -516,17 +608,98 @@ func GetRecentEvents(ctx context.Context, limit int) ([]*EventLog, error) {
 
 	var events []*EventLog
 	for rows.Next() {
-		var ev EventLog
-		err := rows.Scan(&ev.ID, &ev.EventID, &ev.ContractID, &ev.Ledger, &ev.LedgerClosedAt, &ev.EventType, &ev.Data)
+		ev, err := scanEventLog(rows)
 		if err != nil {
 			return nil, fmt.Errorf("queries: scan event: %w", err)
 		}
-		events = append(events, &ev)
+		events = append(events, ev)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("queries: iterate events: %w", err)
 	}
 	return events, nil
+}
+
+// GetEventsByDecodeStatus returns retained events with the given decode
+// status, newest first. It is the reprocessing entry point for rows the
+// current listener build could not decode.
+func GetEventsByDecodeStatus(ctx context.Context, status string, limit int) ([]*EventLog, error) {
+	query := `
+		SELECT ` + eventLogColumns + `
+		FROM events_log
+		WHERE decode_status = $1
+		ORDER BY ledger ASC, id ASC
+		LIMIT $2
+	`
+	rows, err := Pool.Query(ctx, query, status, limit)
+	if err != nil {
+		return nil, fmt.Errorf("queries: get events by decode status: %w", err)
+	}
+	defer rows.Close()
+
+	var events []*EventLog
+	for rows.Next() {
+		ev, err := scanEventLog(rows)
+		if err != nil {
+			return nil, fmt.Errorf("queries: scan event by decode status: %w", err)
+		}
+		events = append(events, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("queries: iterate events by decode status: %w", err)
+	}
+	return events, nil
+}
+
+// GetUnknownVersionEvents returns retained events whose schema version this
+// listener build did not recognize.
+func GetUnknownVersionEvents(ctx context.Context, limit int) ([]*EventLog, error) {
+	return GetEventsByDecodeStatus(ctx, DecodeStatusUnknownVersion, limit)
+}
+
+// GetUndecodedEvents returns every retained row that was not applied:
+// unknown versions and malformed known versions.
+func GetUndecodedEvents(ctx context.Context, limit int) ([]*EventLog, error) {
+	query := `
+		SELECT ` + eventLogColumns + `
+		FROM events_log
+		WHERE decode_status <> $1
+		ORDER BY ledger ASC, id ASC
+		LIMIT $2
+	`
+	rows, err := Pool.Query(ctx, query, DecodeStatusDecoded, limit)
+	if err != nil {
+		return nil, fmt.Errorf("queries: get undecoded events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []*EventLog
+	for rows.Next() {
+		ev, err := scanEventLog(rows)
+		if err != nil {
+			return nil, fmt.Errorf("queries: scan undecoded event: %w", err)
+		}
+		events = append(events, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("queries: iterate undecoded events: %w", err)
+	}
+	return events, nil
+}
+
+// UpdateEventDecodeStatus is used by reprocessing tooling: after a row has
+// been decoded and applied, its status can be advanced without changing the
+// original event identity or payload.
+func UpdateEventDecodeStatus(ctx context.Context, q Querier, eventID, status, decodeError string) error {
+	_, err := q.Exec(ctx, `
+		UPDATE events_log
+		SET decode_status = $2, decode_error = $3
+		WHERE event_id = $1
+	`, eventID, status, decodeError)
+	if err != nil {
+		return fmt.Errorf("queries: update event decode status: %w", err)
+	}
+	return nil
 }
 
 func GetLatestProcessedLedger(ctx context.Context) (int32, error) {
